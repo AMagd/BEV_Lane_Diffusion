@@ -68,21 +68,22 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
     have_mask = False
     for i, data in enumerate(data_loader):
-        with torch.no_grad():
-            result = model(return_loss=False, rescale=True, **data)
+        if i < 10:
+            with torch.no_grad():
+                result = model(return_loss=False, rescale=True, **data)
             # encode mask results
-            if isinstance(result, dict):
-                if 'bbox_results' in result.keys():
-                    bbox_result = result['bbox_results']
-                    batch_size = len(result['bbox_results'])
-                    bbox_results.extend(bbox_result)
-                if 'mask_results' in result.keys() and result['mask_results'] is not None:
-                    mask_result = custom_encode_mask_results(result['mask_results'])
-                    mask_results.extend(mask_result)
-                    have_mask = True
-            else:
-                batch_size = len(result)
-                bbox_results.extend(result)
+            # if isinstance(result, dict):
+            #     if 'bbox_results' in result.keys():
+            #         bbox_result = result['bbox_results']
+            #         batch_size = len(result['bbox_results'])
+            #         bbox_results.extend(bbox_result)
+            #     if 'mask_results' in result.keys() and result['mask_results'] is not None:
+            #         mask_result = custom_encode_mask_results(result['mask_results'])
+            #         mask_results.extend(mask_result)
+            #         have_mask = True
+            # else:
+        batch_size = result.shape[0]
+            #     bbox_results.extend(result)
 
             #if isinstance(result[0], tuple):
             #    assert False, 'this code is for instance segmentation, which our code will not utilize.'
@@ -94,23 +95,23 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                 prog_bar.update()
 
     # collect results from all ranks
-    if gpu_collect:
-        bbox_results = collect_results_gpu(bbox_results, len(dataset))
-        if have_mask:
-            mask_results = collect_results_gpu(mask_results, len(dataset))
-        else:
-            mask_results = None
-    else:
-        bbox_results = collect_results_cpu(bbox_results, len(dataset), tmpdir)
-        tmpdir = tmpdir+'_mask' if tmpdir is not None else None
-        if have_mask:
-            mask_results = collect_results_cpu(mask_results, len(dataset), tmpdir)
-        else:
-            mask_results = None
+    # if gpu_collect:
+    #     bbox_results = collect_results_gpu(bbox_results, len(dataset))
+    #     if have_mask:
+    #         mask_results = collect_results_gpu(mask_results, len(dataset))
+    #     else:
+    #         mask_results = None
+    # else:
+    #     bbox_results = collect_results_cpu(bbox_results, len(dataset), tmpdir)
+    #     tmpdir = tmpdir+'_mask' if tmpdir is not None else None
+    #     if have_mask:
+    #         mask_results = collect_results_cpu(mask_results, len(dataset), tmpdir)
+    #     else:
+    #         mask_results = None
 
-    if mask_results is None:
-        return bbox_results
-    return {'bbox_results': bbox_results, 'mask_results': mask_results}
+    # if mask_results is None:
+    #     return bbox_results
+    return result
 
 
 def collect_results_cpu(result_part, size, tmpdir=None):

@@ -1,0 +1,37 @@
+// NORMAL LAUNCH FOR TRAINING MAPTR
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug dist_train.sh",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/tools/dist_train.sh",
+            "justMyCode": true,
+            "args": [
+                "${workspaceFolder}/projects/configs/maptr/maptr_tiny_r50_24e.py",
+                "4"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/.."
+            }
+        }
+    ]
+}
+
+// LAUNCH FOR RUNNING VISUALIZATION OF MAPTR PREDICTIONS
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//             "name": "Python: Current File",
+//             "type": "python",
+//             "request": "launch",
+//             "program": "${file}",
+//             "console": "integratedTerminal",
+//             "justMyCode": true,
+//             "args": ["/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/work_dirs/maptr_tiny_r50_24e/maptr_tiny_r50_24e.py", "/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/work_dirs/maptr_tiny_r50_24e/epoch_24.pth"],
+//         }
+//     ]
+// }

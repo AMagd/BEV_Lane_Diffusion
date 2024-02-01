@@ -9,6 +9,49 @@ from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet3d.ops import Voxelization, DynamicScatter
 from mmdet3d.models import builder
+import wandb
+from PIL import Image
+import os
+from torchvision.transforms import ToPILImage
+# from tools.BraTS2020 import train as diffunet_train
+from tools.guided_diffusion.script_util import (
+    model_and_diffusion_defaults,
+    create_model_and_diffusion,
+    args_to_dict,
+    add_dict_to_argparser,
+)
+from tools.guided_diffusion.train_util import TrainLoop
+from tools.guided_diffusion.resample import create_named_schedule_sampler
+import argparse
+from tools.guided_diffusion.utils import staple
+from torch.utils.tensorboard import SummaryWriter
+
+import cv2
+import mmcv
+import numpy as np
+# import sys
+# sys.path.append('/home/user/data/Ahmad/Grad/MapTR_DiffUNet/tools/BraTS2020')
+
+# class MapTR_DiffUNet_Trainer(diffunet_train.BraTSTrainer):
+#     def __init__(self, *args, **kwargs):
+#         super(MapTR_DiffUNet_Trainer, self).__init__(*args, **kwargs)
+
+    
+    # def training_step(self, batch):
+    #     # Assuming the batch contains the following:
+    #     # - input_data: the original input data for the MapTR model
+    #     # - ground_truth_label: the ground truth label
+    #     # - bev_features: the BEV features extracted from the MapTR model
+    #     input_data, ground_truth_label, bev_features = batch
+
+    #     # Use bev_features as input to Diff-UNet
+    #     output = self.model(bev_features, ground_truth_label, pred_type="train")
+
+    #     # Calculate the loss
+    #     loss = self.loss_function(output, ground_truth_label)
+
+    #     return loss
+
 @DETECTORS.register_module()
 class MapTR(MVXTwoStageDetector):
     """MapTR.
@@ -35,7 +78,8 @@ class MapTR(MVXTwoStageDetector):
                  video_test_mode=False,
                  modality='vision',
                  lidar_encoder=None,
-                 ):
+                 bev_h=256,
+                 bev_w=128):
 
         super(MapTR,
               self).__init__(pts_voxel_layer, pts_voxel_encoder,
@@ -43,10 +87,15 @@ class MapTR(MVXTwoStageDetector):
                              img_backbone, pts_backbone, img_neck, pts_neck,
                              pts_bbox_head, img_roi_head, img_rpn_head,
                              train_cfg, test_cfg, pretrained)
+        self._epoch = 0
+        self.val_counter = 0
+        self.bev_h = bev_h
+        self.bev_w = bev_w
         self.grid_mask = GridMask(
             True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
         self.fp16_enabled = False
+        self.first_batch = True
 
         # temporal
         self.video_test_mode = video_test_mode
@@ -68,8 +117,83 @@ class MapTR(MVXTwoStageDetector):
                     "backbone": builder.build_middle_encoder(lidar_encoder["backbone"]),
                 }
             )
-            self.voxelize_reduce = lidar_encoder.get("voxelize_reduce", True)
+            self.voxelize_reduce = lidar_encoder.get("voxelize_reduce", True) 
+        
+        self.ablation_study = "bev_only" # "bev_only", "bev_plus_imgs", "imgs_only"
 
+        # self.diff_unet_model = diffunet_train.DiffUNet(256) # TODO: change the number of channels to be taken from the config file!
+        # self.create_diff_trainer(model = self.diff_unet_model)
+        args_list = self.diff_args()
+        self.diff_args = create_diff_model_args().parse_args(args_list)
+        self.diff_model, self.diffusion = create_model_and_diffusion(
+        **args_to_dict(self.diff_args, model_and_diffusion_defaults().keys())
+        )
+
+        # for sample
+        self.val_miou_overall = 0
+        self.val_miou_lane = 0
+        self.val_miou_road_boundary = 0
+        self.val_miou_pedestrian_crossing = 0
+        
+        # for cal
+        self.val_miou_overall2 = 0
+        self.val_miou_lane2 = 0
+        self.val_miou_road_boundary2 = 0
+        self.val_miou_pedestrian_crossing2 = 0
+        self.val_index = 0
+        # self.training = False
+
+
+        self.schedule_sampler = create_named_schedule_sampler(self.diff_args.schedule_sampler, self.diffusion,  maxt=self.diff_args.diffusion_steps)
+        self.diff_train_loop = TrainLoop(
+                    model=self.diff_model,
+                    diffusion=self.diffusion,
+                    classifier=None,
+                    # data=data,
+                    # dataloader=datal,
+                    batch_size=self.diff_args.batch_size,
+                    microbatch=self.diff_args.microbatch,
+                    lr=self.diff_args.lr,
+                    ema_rate=self.diff_args.ema_rate,
+                    log_interval=self.diff_args.log_interval,
+                    save_interval=self.diff_args.save_interval,
+                    # resume_checkpoint=self.diff_args.resume_checkpoint,
+                    use_fp16=self.diff_args.use_fp16,
+                    fp16_scale_growth=self.diff_args.fp16_scale_growth,
+                    schedule_sampler=self.schedule_sampler,
+                    weight_decay=self.diff_args.weight_decay,
+                    lr_anneal_steps=self.diff_args.lr_anneal_steps,
+                    )        
+
+    def diff_args(self):
+        if self.ablation_study == "bev_plus_imgs":
+            in_ch = str(256 + 108 + 4)
+        elif self.ablation_study == "bev_only":
+            in_ch = str(256 + 4)
+        elif self.ablation_study == "imgs_only":
+            in_ch = str(108 + 4)
+
+        return [
+            '--data_dir', './',
+            '--out_dir', './diff_results',
+            '--image_size', '256',
+            '--num_channels', '128',
+            '--class_cond', 'False',
+            '--num_res_blocks', '2',
+            '--num_heads', '1',
+            '--learn_sigma', 'True',
+            '--use_scale_shift_norm', 'False',
+            '--attention_resolutions', '16',
+            '--diffusion_steps', '1000',
+            '--noise_schedule', 'linear',
+            '--rescale_learned_sigmas', 'False',
+            '--rescale_timesteps', 'False',
+            '--lr', '1e-4',
+            '--batch_size', '8',
+            '--in_ch', in_ch, # bev features + 4
+            "--num_ensemble", "1",
+            "--num_classes", "4"
+        ]
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
         """Extract features of images."""
@@ -89,13 +213,13 @@ class MapTR(MVXTwoStageDetector):
             if self.use_grid_mask:
                 img = self.grid_mask(img)
 
-            img_feats = self.img_backbone(img)
+            img_feats = self.img_backbone(img) # ResNet features
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
         else:
             return None
         if self.with_img_neck:
-            img_feats = self.img_neck(img_feats)
+            img_feats = self.img_neck(img_feats) # FPN features
 
         img_feats_reshaped = []
         for img_feat in img_feats:
@@ -105,6 +229,28 @@ class MapTR(MVXTwoStageDetector):
             else:
                 img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W))
         return img_feats_reshaped
+    
+    def create_diff_trainer(self, model):
+        logdir = './logdir'
+        env = "pytorch" # or env = "pytorch" if you only have one gpu.
+
+        max_epoch = 30
+        batch_size = 4
+        val_every = 10
+        num_gpus = 4
+        # device = "cuda:0"
+
+        # self.diff_unet = diffunet_train.DiffUNet()
+        self.diff_unet_trainer = MapTR_DiffUNet_Trainer(env_type=env,
+                                                        max_epochs=max_epoch,
+                                                        batch_size=batch_size,
+                                                        device=None,
+                                                        logdir=logdir,
+                                                        val_every=val_every,
+                                                        num_gpus=num_gpus,
+                                                        master_port=17751,
+                                                        training_script=__file__,
+                                                        model=model)
 
     @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_feat(self, img, img_metas=None, len_queue=None):
@@ -122,7 +268,9 @@ class MapTR(MVXTwoStageDetector):
                           gt_labels_3d,
                           img_metas,
                           gt_bboxes_ignore=None,
-                          prev_bev=None):
+                          prev_bev=None,
+                          seg_label=None,
+                          img = None):
         """Forward function'
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -138,10 +286,35 @@ class MapTR(MVXTwoStageDetector):
             dict: Losses of each branch.
         """
 
-        outs = self.pts_bbox_head(
-            pts_feats, lidar_feat, img_metas, prev_bev)
-        loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
-        losses = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
+        # self.training = True
+
+        if self.ablation_study != "imgs_only":
+            outs = self.pts_bbox_head(
+                pts_feats, lidar_feat, img_metas, prev_bev) # BEV features
+            
+            outs = outs.permute(0, 2, 1)
+            outs = outs.reshape(outs.shape[0], outs.shape[1], seg_label.shape[-2], seg_label.shape[-1])
+            # outs = outs[:, :, None, ...]
+
+        if self.ablation_study == "bev_plus_imgs":
+            outs = torch.cat([outs, img.view(img.shape[0], -1, img.shape[3], img.shape[4]).unfold(2, outs.shape[2], outs.shape[2]).unfold(3, outs.shape[3], outs.shape[3]).permute(0, 2, 3, 1, 4, 5).contiguous().view(img.shape[0], -1, outs.shape[2], outs.shape[3])], dim=1)
+        elif self.ablation_study == "imgs_only":
+            outs = img.view(img.shape[0], -1, img.shape[3], img.shape[4]).unfold(2, seg_label.shape[-2], seg_label.shape[-2]).unfold(3, seg_label.shape[-1], seg_label.shape[-1]).permute(0, 2, 3, 1, 4, 5).contiguous().view(img.shape[0], -1, seg_label.shape[-2], seg_label.shape[-1])
+        
+        seg_label = seg_label.reshape(outs.shape[0], -1, seg_label.shape[-2], seg_label.shape[-1])
+            
+        #TODO change outs shape to count for temporal inputs (queue length > 1 )
+        ############################### PUT DIFFUSION HERE ##################################
+
+        loss = self.diff_train_loop.run_step(outs, seg_label, img_metas)
+
+        losses = {'Diffusion_loss': loss}
+
+
+        #####################################################################################
+
+        # loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+        # losses = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
         return losses
 
     def forward_dummy(self, img):
@@ -162,6 +335,7 @@ class MapTR(MVXTwoStageDetector):
             return self.forward_train(**kwargs)
         else:
             return self.forward_test(**kwargs)
+            # return self.forward_test(**kwargs)
     
     def obtain_history_bev(self, imgs_queue, img_metas_list):
         """Obtain history BEV features iteratively. To save GPU memory, gradients are not calculated.
@@ -234,7 +408,7 @@ class MapTR(MVXTwoStageDetector):
                       gt_bboxes_ignore=None,
                       img_depth=None,
                       img_mask=None,
-                      ):
+                      seg_label=None,):
         """Forward training function.
         Args:
             points (list[torch.Tensor], optional): Points of each sample.
@@ -276,7 +450,7 @@ class MapTR(MVXTwoStageDetector):
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, lidar_feat, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
-                                            gt_bboxes_ignore, prev_bev)
+                                            gt_bboxes_ignore, prev_bev, seg_label, img)
 
         losses.update(losses_pts)
         return losses
@@ -308,13 +482,13 @@ class MapTR(MVXTwoStageDetector):
             img_metas[0][0]['can_bus'][-1] = 0
             img_metas[0][0]['can_bus'][:3] = 0
 
-        new_prev_bev, bbox_results = self.simple_test(
+        new_prev_bev, pred = self.simple_test(
             img_metas[0], img[0], points[0], prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
         # During inference, we save the BEV features and ego motion of each timestamp.
         self.prev_frame_info['prev_pos'] = tmp_pos
         self.prev_frame_info['prev_angle'] = tmp_angle
         self.prev_frame_info['prev_bev'] = new_prev_bev
-        return bbox_results
+        return pred
 
     def pred2result(self, bboxes, scores, labels, pts, attrs=None):
         """Convert detection results to a list of numpy arrays.
@@ -344,19 +518,232 @@ class MapTR(MVXTwoStageDetector):
             result_dict['attrs_3d'] = attrs.cpu()
 
         return result_dict
-    def simple_test_pts(self, x, lidar_feat, img_metas, prev_bev=None, rescale=False):
+    def simple_test_pts(self, x, lidar_feat, img_metas, prev_bev=None, rescale=False, img=None, **kwargs):
         """Test function"""
-        outs = self.pts_bbox_head(x, lidar_feat, img_metas, prev_bev=prev_bev)
+        seg_label = kwargs['seg_label']
 
-        bbox_list = self.pts_bbox_head.get_bboxes(
-            outs, img_metas, rescale=rescale)
+        if self.ablation_study != "imgs_only":
+            bev_embed = self.pts_bbox_head(x, lidar_feat, img_metas, prev_bev=prev_bev)
+            outs = bev_embed.permute(0, 2, 1)
+            outs = outs.reshape(outs.shape[0], outs.shape[1], seg_label.shape[-2], seg_label.shape[-1])
+        # outs = outs[:, :, None, ...]
+
+        if self.ablation_study == "bev_plus_imgs":
+            outs = torch.cat([outs, img.view(img.shape[0], -1, img.shape[3], img.shape[4]).unfold(2, outs.shape[2], outs.shape[2]).unfold(3, outs.shape[3], outs.shape[3]).permute(0, 2, 3, 1, 4, 5).contiguous().view(img.shape[0], -1, outs.shape[2], outs.shape[3])], dim=1)
+        elif self.ablation_study == "imgs_only":
+            outs = img.view(img.shape[0], -1, img.shape[3], img.shape[4]).unfold(2, seg_label.shape[-2], seg_label.shape[-2]).unfold(3, seg_label.shape[-1], seg_label.shape[-1]).permute(0, 2, 3, 1, 4, 5).contiguous().view(img.shape[0], -1, seg_label.shape[-2], seg_label.shape[-1])
+            bev_embed = outs
+
+
+        seg_label = seg_label.reshape(outs.shape[0], -1, seg_label.shape[-2], seg_label.shape[-1])
+
+        folder = "pretrained_bev"
+        if not os.path.exists(f"/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/Test_Results_{folder}/{self.val_index:04}"):
+            os.makedirs(f"/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/Test_Results_{folder}/{self.val_index:04}")
+
+        # if not self.training:
+        # torch.save(seg_label[0].float().cpu(), f"/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/Test_Results_{folder}/{self.val_index:04}/seg_label.pt")
+
+        #TODO change outs shape to count for temporal inputs (queue length > 1 )
+        ############################### PUT DIFFUSION HERE ##################################
+
+        if self.diff_train_loop.counter == 0 and outs.device.index==0 and not self.diff_train_loop.writer_exists:
+            self.diff_train_loop.writer = SummaryWriter(self.diff_train_loop.log_dir)
+            self.diff_train_loop.writer_exists = True
         
-        bbox_results = [
-            self.pred2result(bboxes, scores, labels, pts)
-            for bboxes, scores, labels, pts in bbox_list
-        ]
-        # import pdb;pdb.set_trace()
-        return outs['bev_embed'], bbox_results
+        sample_type = "loop"
+        if sample_type == "loop":
+            m = seg_label
+            c = torch.randn_like(outs[:, :4, ...])
+            img = torch.cat((outs, c), dim=1)     #add a noise channel$
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            enslist = []
+            enslist2 = []
+
+            for _ in range(self.diff_args.num_ensemble):  #this is for the generation of an ensemble of 5 masks.
+                model_kwargs = {}
+                start.record()
+                sample_fn = (
+                    self.diffusion.p_sample_loop_known if not self.diff_args.use_ddim else self.diffusion.ddim_sample_loop_known
+                )
+                if self.diff_args.use_ddim:
+                    sample, x_noisy, org = sample_fn(
+                        self.diff_model,
+                        (outs.shape[0], 3, outs.shape[2], outs.shape[3]), img,
+                        # step = self.diff_args.diffusion_steps,
+                        clip_denoised=self.diff_args.clip_denoised,
+                        model_kwargs=model_kwargs,
+                    )
+                    # sample, x_noisy, org = sample[:,-4,...], x_noisy[:,-4,...], org[:,-4,...]
+                    cal = sample
+                else:
+                    sample, x_noisy, org, cal, cal_out = sample_fn(
+                        self.diff_model,
+                        (outs.shape[0], 3, outs.shape[2], outs.shape[3]), img,
+                        step = self.diff_args.diffusion_steps,
+                        clip_denoised=self.diff_args.clip_denoised,
+                        model_kwargs=model_kwargs,
+                    )
+
+                end.record()
+                torch.cuda.synchronize()
+                print('time for 1 sample', start.elapsed_time(end))  #time measurement for the generation of 1 sample
+
+                co = torch.tensor(cal)
+                if self.diff_args.version == 'new':
+                    enslist.append(sample[0,:,:,:])
+                else:
+                    enslist.append(co[0,:,:,:])
+                
+                enslist2.append(co[0,:,:,:])
+
+            ensres = staple(torch.stack(enslist,dim=0)).squeeze(0)
+            ensres2 = staple(torch.stack(enslist2,dim=0)).squeeze(0)
+            if outs.device.index == 0:
+                
+                filename = img_metas[0]['filename']
+                filename[0], filename[1], filename[2], filename[3], filename[4] = filename[2], filename[0], filename[1], filename[4], filename[3]
+                img = [mmcv.imread(name, channel_order='rgb') for name in filename]
+                cams_img = cv2.resize(cv2.vconcat([cv2.hconcat(img[:3]),cv2.hconcat(img[3:])]), (img_metas[0]['ori_shape'][0][1]*3, img_metas[0]['ori_shape'][0][0]*2))
+
+                ################################## Metrics #######################################
+                dice_scores, overall_dice = dice_score_per_class(ensres[None, ...], seg_label)
+                iou_scores, overall_iou = iou_per_class(ensres[None, ...], seg_label)
+
+                dice_scores2, overall_dice2 = dice_score_per_class(ensres2[None, ...], seg_label)
+                iou_scores2, overall_iou2 = iou_per_class(ensres2[None, ...], seg_label)
+
+                # save_tensor_as_image(ensres[1:].float(), f"/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/Test_Results_{folder}/{self.val_index:04}/ensres.png")
+                # save_tensor_as_image(ensres2[1:].float(), f"/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/Test_Results_{folder}/{self.val_index:04}/ensres2.png")
+
+                model_name = ""
+                # model_name = self.diff_train_loop.name
+
+                self.val_index += 1
+
+                # for sample
+                self.val_miou_overall = self.val_miou_overall + (iou_scores[1:].mean() - self.val_miou_overall) / self.val_index
+                self.val_miou_lane = self.val_miou_lane + (iou_scores[1] - self.val_miou_lane) / self.val_index
+                self.val_miou_pedestrian_crossing = self.val_miou_pedestrian_crossing + (iou_scores[2] - self.val_miou_pedestrian_crossing) / self.val_index
+                self.val_miou_road_boundary = self.val_miou_road_boundary + (iou_scores[3] - self.val_miou_road_boundary) / self.val_index
+
+                # for cal
+                self.val_miou_overall2 = self.val_miou_overall2 + (iou_scores2[1:].mean() - self.val_miou_overall2) / self.val_index
+                self.val_miou_lane2 = self.val_miou_lane2 + (iou_scores2[1] - self.val_miou_lane2) / self.val_index
+                self.val_miou_pedestrian_crossing2 = self.val_miou_pedestrian_crossing2 + (iou_scores2[2] - self.val_miou_pedestrian_crossing2) / self.val_index
+                self.val_miou_road_boundary2 = self.val_miou_road_boundary2 + (iou_scores2[3] - self.val_miou_road_boundary2) / self.val_index
+
+                for i, label_name in enumerate(['background', 'lanes', 'pedestrian_crossing', 'road_boundary']):
+                    wandb.log({f"val/dice_score_{label_name}{model_name}": dice_scores[i]})
+                    wandb.log({f"val/iou_{label_name}{model_name}": iou_scores[i]})
+                wandb.log({f"val/overall_dice{model_name}": overall_dice})
+                wandb.log({f"val/overall_dice_without_background{model_name}": dice_scores[1:].mean()})
+                wandb.log({f"val/overall_iou{model_name}": overall_iou})
+                wandb.log({f"val/overall_iou_without_background{model_name}": iou_scores[1:].mean()})
+
+                # for sample
+                wandb.log({f"val/overall_miou_without_background_sample{model_name}": self.val_miou_overall})
+                wandb.log({f"val/miou_lane_sample{model_name}": self.val_miou_lane})
+                wandb.log({f"val/miou_road_boundary_sample{model_name}": self.val_miou_road_boundary})
+                wandb.log({f"val/miou_pedestrian_crossing_sample{model_name}": self.val_miou_pedestrian_crossing})
+                
+                # for cal
+                wandb.log({f"val/overall_miou_without_background_cal{model_name}": self.val_miou_overall2})
+                wandb.log({f"val/miou_lane_cal{model_name}": self.val_miou_lane2})
+                wandb.log({f"val/miou_road_boundary_cal{model_name}": self.val_miou_road_boundary2})
+                wandb.log({f"val/miou_pedestrian_crossing_cal{model_name}": self.val_miou_pedestrian_crossing2})
+                ##################################################################################
+
+                wandb.log({"val/GT": wandb.Image(seg_label.float()[0][1:4])})
+                wandb.log({"val/Sur_Imgs": wandb.Image(cams_img)})
+                # if not self.training:
+                # torch.save(torch.from_numpy(cams_img), f"/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/Test_Results_{folder}/{self.val_index:04}_cams_img.pt")
+                wandb.log({f"val/Pred_cal{model_name}": wandb.Image(cal[0][1:4])})
+                wandb.log({f"val/Pred_ensres{model_name}": wandb.Image(ensres[1:4])})
+                wandb.log({f"val/Pred_sample{model_name}": wandb.Image(x_noisy[0][1:4])})
+                
+            elif sample_type == "one_step":
+                with torch.no_grad():
+                    loss, sample, cal, losses, t = self.diff_train_loop.run_step(outs, seg_label, img_metas, "test")
+                if loss.device.index==0:
+                    
+                    filename = img_metas[0]['filename']
+                    filename[0], filename[1], filename[2], filename[3], filename[4] = filename[2], filename[0], filename[1], filename[4], filename[3]
+                    img = [mmcv.imread(name, channel_order='rgb') for name in filename]
+                    cams_img = cv2.resize(cv2.vconcat([cv2.hconcat(img[:3]),cv2.hconcat(img[3:])]), (img_metas[0]['ori_shape'][0][1]*3, img_metas[0]['ori_shape'][0][0]*2))
+
+                    wandb.log({"val/GT": wandb.Image(seg_label.float()[0][1:4])})
+                    wandb.log({"val/Sur_Imgs": wandb.Image(grid)})
+                    wandb.log({"val/Pred": wandb.Image(cal[0][1:4])})
+                    wandb.log({"val/sample": wandb.Image(sample[0][1:4])})
+                    wandb.log({"val/loss": loss})
+                    for key, value in losses.items():
+                        wandb.log({f"val/{key}": value.mean()})
+
+        #     if outs.device.index == 0:
+                
+        #         filename = img_metas[0]['filename']
+        #         filename[0], filename[1], filename[2], filename[3], filename[4] = filename[2], filename[0], filename[1], filename[4], filename[3]
+        #         img = [mmcv.imread(name, channel_order='rgb') for name in filename]
+        #         cams_img = cv2.resize(cv2.vconcat([cv2.hconcat(img[:3]),cv2.hconcat(img[3:])]), (img_metas[0]['ori_shape'][0][1]*3, img_metas[0]['ori_shape'][0][0]*2))
+
+        #         ################################## Metrics #######################################
+        #         dice_scores, overall_dice = dice_score_per_class(ensres[None, ...], seg_label)
+        #         iou_scores, overall_iou = iou_per_class(ensres[None, ...], seg_label)
+        #         for i, label_name in enumerate(['background', 'lanes', 'pedestrian_crossing', 'road_boundary']):
+        #             self.diff_train_loop.writer.add_scalar(f"val/dice_score_{label_name}", scalar_value=dice_scores[i], global_step = self.val_counter)
+        #             self.diff_train_loop.writer.add_scalar(f"val/iou_{label_name}", scalar_value=iou_scores[i], global_step = self.val_counter)
+        #         self.diff_train_loop.writer.add_scalar(f"val/overall_dice", scalar_value=overall_dice, global_step = self.val_counter)
+        #         self.diff_train_loop.writer.add_scalar(f"val/overall_iou", scalar_value=overall_iou, global_step = self.val_counter)
+        #         ##################################################################################
+
+        #         self.diff_train_loop.writer.add_image('val/GT', seg_label.float()[0][1:4], self.val_counter)
+        #         self.diff_train_loop.writer.add_image('val/Sur_Imgs', np.transpose(cams_img, (2, 0, 1)), self.val_counter)
+        #         self.diff_train_loop.writer.add_image('val/Pred_cal', cal[0][1:4], self.val_counter)
+        #         self.diff_train_loop.writer.add_image('val/Pred_ensres', ensres[1:4], self.val_counter)
+        #         self.diff_train_loop.writer.add_image('val/Pred_sample', sample[0][1:4], self.val_counter)
+        #         self.diff_train_loop.writer.flush()
+        #         self.val_counter += 1
+        #     # vutils.save_image(ensres, fp = os.path.join(self.diff_args.out_dir, str(slice_ID)+'_output_ens'+".jpg"), nrow = 1, padding = 10)
+
+        #     if self.ablation_study == "imgs_only":
+        #         return outs, ensres
+        #     else:
+        #         return bev_embed, ensres
+        
+        # elif sample_type == "one_step":
+        #     with torch.no_grad():
+        #         loss, sample, cal, losses, t = self.diff_train_loop.run_step(outs, seg_label, img_metas, "test")
+        #     if loss.device.index==0:
+                
+        #         filename = img_metas[0]['filename']
+        #         filename[0], filename[1], filename[2], filename[3], filename[4] = filename[2], filename[0], filename[1], filename[4], filename[3]
+        #         img = [mmcv.imread(name, channel_order='rgb') for name in filename]
+        #         cams_img = cv2.resize(cv2.vconcat([cv2.hconcat(img[:3]),cv2.hconcat(img[3:])]), (img_metas[0]['ori_shape'][0][1]*3, img_metas[0]['ori_shape'][0][0]*2))
+
+        #         self.diff_train_loop.writer.add_image('val/GT', seg_label.float()[0][1:4], self.val_counter)
+        #         self.diff_train_loop.writer.add_image('val/Sur_Imgs', grid, self.val_counter)
+        #         self.diff_train_loop.writer.add_image('val/Pred', cal[0][1:4], self.val_counter)
+        #         self.diff_train_loop.writer.add_image('val/sample', sample[0][1:4], self.val_counter)
+        #         self.diff_train_loop.writer.add_scalar("val/loss", loss, self.val_counter)
+        #         for key, value in losses.items():
+        #             self.diff_train_loop.writer.add_scalar(f"val/{key}", value.mean(), self.val_counter)
+        #         # self.diff_train_loop.writer.add_scalar("val/loss_diff", losses['loss_diff'].mean(), self.val_counter)
+        #         # self.diff_train_loop.writer.add_scalar("val/loss_cal", losses['loss_cal'].mean(), self.val_counter)
+        #         # self.diff_train_loop.writer.add_scalar("val/oss_cal_bce", losses['loss_cal_bce'].mean(), self.val_counter)
+        #         self.diff_train_loop.writer.add_histogram("val/t", t[0], self.val_counter)
+        #         self.diff_train_loop.writer.flush()
+        #         self.val_counter += 1
+
+            print(f"Finished {self.val_index:04} Samples!!")
+
+            return bev_embed, cal
+
+        #####################################################################################
+
+    
     def simple_test(self, img_metas, img=None, points=None, prev_bev=None, rescale=False, **kwargs):
         """Test function without augmentaiton."""
         lidar_feat = None
@@ -364,12 +751,12 @@ class MapTR(MVXTwoStageDetector):
             lidar_feat = self.extract_lidar_feat(points)
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
 
-        bbox_list = [dict() for i in range(len(img_metas))]
-        new_prev_bev, bbox_pts = self.simple_test_pts(
-            img_feats, lidar_feat, img_metas, prev_bev, rescale=rescale)
-        for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
-            result_dict['pts_bbox'] = pts_bbox
-        return new_prev_bev, bbox_list
+        # bbox_list = [dict() for i in range(len(img_metas))]
+        new_prev_bev, pred = self.simple_test_pts(
+            img_feats, lidar_feat, img_metas, prev_bev, rescale=rescale, img=img, **kwargs)
+        # for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
+        #     result_dict['pts_bbox'] = pts_bbox
+        return new_prev_bev, pred
 
 
 @DETECTORS.register_module()
@@ -440,3 +827,110 @@ class MapTR_fp16(MapTR):
         prev_bev = data.get('prev_bev', None)
         prev_bev = self.pts_bbox_head(img_feats, img_metas, prev_bev=prev_bev, only_bev=True)
         return prev_bev
+    
+def create_diff_model_args():
+    defaults = dict(
+        data_name = 'BRATS',
+        data_dir="../dataset/brats2020/training",
+        schedule_sampler="uniform",
+        lr=1e-4,
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        batch_size=1,
+        microbatch=-1,  # -1 disables microbatches
+        ema_rate="0.9999",  # comma-separated list of EMA values
+        log_interval=100,
+        save_interval=5000,
+        resume_checkpoint=None, #"/results/pretrainedmodel.pt"
+        use_fp16=False,
+        fp16_scale_growth=1e-3,
+        gpu_dev = "0",
+        multi_gpu = "0,1,2,3",
+        out_dir='./results/',
+        num_ensemble=1,
+        debug=True,
+        num_samples=1,
+        model_path="",
+        use_ddim=False, 
+        clip_denoised=True,
+        dpm_solver=True,
+        num_classes=1,
+    )
+    defaults.update(model_and_diffusion_defaults())
+    parser = argparse.ArgumentParser()
+    add_dict_to_argparser(parser, defaults)
+    return parser
+
+def add_dict_to_argparser(parser, default_dict):
+    for k, v in default_dict.items():
+        v_type = type(v)
+        if v is None:
+            v_type = str
+        elif isinstance(v, bool):
+            v_type = str2bool
+        parser.add_argument(f"--{k}", default=v, type=v_type)
+
+def str2bool(v):
+    """
+    https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
+    """
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("boolean value expected")
+    
+def dice_score_per_class(pred, gt, eps=1e-8):
+    """
+    Compute Dice score for each class separately.
+    The Dice score is 2 * intersection / (sum of two sets).
+    Args:
+        pred: predicted tensor, shape = (batch, num_classes, H, W)
+        gt: ground truth tensor, shape = (batch, num_classes, H, W)
+        eps: a small number to avoid zero division
+    Returns:
+        dice_score: tensor of dice scores for each class
+        overall_dice: scalar for overall dice score
+    """
+    intersection = (pred * gt).sum(dim=(0, 2, 3))
+    union = pred.sum(dim=(0, 2, 3)) + gt.sum(dim=(0, 2, 3))
+    dice_score = (2. * intersection) / (union + eps)
+    overall_dice = dice_score.mean()
+    return dice_score, overall_dice
+
+def iou_per_class(pred, gt, eps=1e-8):
+    """
+    Compute Intersection over Union (IoU) for each class separately.
+    IoU is intersection / union.
+    Args:
+        pred: predicted tensor, shape = (batch, num_classes, H, W)
+        gt: ground truth tensor, shape = (batch, num_classes, H, W)
+        eps: a small number to avoid zero division
+    Returns:
+        iou: tensor of IoU for each class
+        overall_iou: scalar for overall IoU
+    """
+    intersection = (pred * gt).sum(dim=(0, 2, 3))
+    union = pred.sum(dim=(0, 2, 3)) + gt.sum(dim=(0, 2, 3)) - intersection
+    iou = intersection / (union + eps)
+    overall_iou = iou.mean()
+    return iou, overall_iou
+
+def save_tensor_as_image(tensor, path):
+    tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min())
+
+    if tensor.dim() != 3:
+        raise ValueError("Tensor dimension should be 3 (channels x height x width)")
+
+    if tensor.size(0) != 3:
+        raise ValueError("The first dimension of tensor should be 3 for RGB")
+
+    # Convert the tensor to PIL Image
+    to_pil = ToPILImage()
+    img = to_pil(tensor)
+
+    # Save the image
+    img.save(path)

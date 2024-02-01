@@ -14,6 +14,8 @@ from .nuscnes_eval import NuScenesEval_custom
 from projects.mmdet3d_plugin.models.utils.visual import save_tensor
 from mmcv.parallel import DataContainer as DC
 import random
+import torchvision.transforms.functional as F
+
 
 from .nuscenes_dataset import CustomNuScenesDataset
 from nuscenes.map_expansion.map_api import NuScenesMap, NuScenesMapExplorer
@@ -22,7 +24,23 @@ from shapely import affinity, ops
 from shapely.geometry import LineString, box, MultiPolygon, MultiLineString
 from mmdet.datasets.pipelines import to_tensor
 import json
+from matplotlib import pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
+from PIL import Image
+from PIL import ImageDraw
+
+from nuscenes import NuScenes
+
+from skimage.draw import line_aa
+
+CLASS2LABEL = {
+        'road_divider': 0,
+        'lane_divider': 0,
+        'ped_crossing': 1,
+        'contours': 2,
+        'others': -1
+    }
 
 def add_rotation_noise(extrinsics, std=0.01, mean=0.0):
     #n = extrinsics.shape[0]
@@ -794,7 +812,7 @@ class VectorizedLocalMap(object):
                                                       origin=(patch_x, patch_y), use_radians=False)
                         new_polygon = affinity.affine_transform(new_polygon,
                                                                 [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
-                        if new_polygon.geom_type is 'Polygon':
+                        if new_polygon.geom_type == 'Polygon':
                             new_polygon = MultiPolygon([new_polygon])
                         polygon_list.append(new_polygon)
 
@@ -809,7 +827,7 @@ class VectorizedLocalMap(object):
                                                       origin=(patch_x, patch_y), use_radians=False)
                         new_polygon = affinity.affine_transform(new_polygon,
                                                                 [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
-                        if new_polygon.geom_type is 'Polygon':
+                        if new_polygon.geom_type == 'Polygon':
                             new_polygon = MultiPolygon([new_polygon])
                         polygon_list.append(new_polygon)
 
@@ -819,7 +837,7 @@ class VectorizedLocalMap(object):
         if layer_name not in self.map_explorer[location].map_api.non_geometric_line_layers:
             raise ValueError("{} is not a line layer".format(layer_name))
 
-        if layer_name is 'traffic_light':
+        if layer_name == 'traffic_light':
             return None
 
         patch_x = patch_box[0]
@@ -860,7 +878,7 @@ class VectorizedLocalMap(object):
                                                       origin=(patch_x, patch_y), use_radians=False)
                     new_polygon = affinity.affine_transform(new_polygon,
                                                             [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
-                    if new_polygon.geom_type is 'Polygon':
+                    if new_polygon.geom_type == 'Polygon':
                         new_polygon = MultiPolygon([new_polygon])
                     polygon_list.append(new_polygon)
 
@@ -940,6 +958,24 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
         self.is_vis_on_test = False
         self.noise = noise
         self.noise_std = noise_std
+
+        #######################################
+        data_conf = {}
+        data_conf['xbound'] = [-30.0, 30.0, 0.15]
+        data_conf['ybound'] = [-15.0, 15.0, 0.15]
+        patch_h = data_conf['ybound'][1] - data_conf['ybound'][0]
+        patch_w = data_conf['xbound'][1] - data_conf['xbound'][0]
+        canvas_h = int(patch_h / data_conf['ybound'][2])
+        canvas_w = int(patch_w / data_conf['xbound'][2])
+        canvas_size = (canvas_h, canvas_w)
+        patch_size = (patch_h, patch_w)
+        self.hdmapnet_vector_map = HDMapNetVectorizedLocalMap(kwargs['data_root'], patch_size=patch_size, canvas_size=canvas_size)
+        #######################################
+        
+        
+        self.nusc = NuScenes(version='v1.0-trainval', dataroot='/home/user/data/Ahmad/Grad/MapTR_MedSegDiff/data/nuscenes', verbose=False)
+        # self.nusc_samples_dict = {s['token']: s for s in self.nusc.sample}
+
     @classmethod
     def get_map_classes(cls, map_classes=None):
         """Get class names of current dataset.
@@ -1014,7 +1050,151 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
         example['gt_labels_3d'] = DC(gt_vecs_label, cpu_only=False)
         example['gt_bboxes_3d'] = DC(gt_vecs_pts_loc, cpu_only=True)
         return example
+    
+    def one_hot_to_rgb(self, one_hot_tensor):
+        # Define color for each class
+        colors = torch.tensor([[255, 165, 0], [0, 0, 255], [0, 255, 0]], dtype=torch.uint8)  # blue, orange, green
 
+        # Expand dimensions for broadcasting
+        rgb_image = torch.zeros(one_hot_tensor.shape, dtype=torch.uint8)
+        rgb_image[:, one_hot_tensor[0]] = colors[0][:,None]
+        rgb_image[:, one_hot_tensor[1]] = colors[1][:,None]
+        rgb_image[:, one_hot_tensor[2]] = colors[2][:,None]
+
+        return rgb_image
+    
+    def get_seg_label(self, input_dict, type="fixed_num_sampled_points", vis_car=False, out_type="one-hot-encoded"):
+        gt_lines_fixed_num_pts = input_dict['gt_bboxes_3d'].data.fixed_num_sampled_points
+        gt_labels_3d = input_dict['gt_labels_3d'].data
+
+        canvas_height = self.bev_size[0]
+        canvas_width = self.bev_size[1]
+        scale_x = canvas_width / (self.pc_range[3] - self.pc_range[0])
+        scale_y = canvas_height / (self.pc_range[4] - self.pc_range[1])
+
+        if out_type == "one-hot-encoded":
+            output = torch.zeros((self.NUM_MAPCLASSES + 1, canvas_height, canvas_width), dtype=torch.bool)
+            output[0,...] = True
+        elif out_type == "integer-encoded":
+            output = torch.zeros((canvas_height, canvas_width), dtype=torch.long)
+
+        if type=="fixed_num_sampled_points":
+            for gt_bbox_3d, gt_label_3d in zip(gt_lines_fixed_num_pts, gt_labels_3d):
+                pts = gt_bbox_3d.numpy()
+                x = np.array([int((pt[0] - self.pc_range[0]) * scale_x) for pt in pts])
+                y = np.array([int((pt[1] - self.pc_range[1]) * scale_y) for pt in pts])
+
+                for i in range(len(x) - 1):
+                    rr, cc, val = line_aa(y[i], x[i], y[i+1], x[i+1])
+
+                    valid_indices = (0 <= rr) & (rr < canvas_height) & (0 <= cc) & (cc < canvas_width)
+                    rr, cc, val = rr[valid_indices], cc[valid_indices], val[valid_indices]
+
+                    if out_type == "one-hot-encoded":
+                        output[:, rr, cc] = False
+                        output[gt_label_3d + 1, rr, cc] = True
+                    elif out_type == "integer-encoded":
+                        output[rr, cc] = gt_label_3d + 1
+
+        elif type=="instance_list":
+            gt_lines_instance = gt_lines_fixed_num_pts = input_dict['gt_bboxes_3d'].data.instance_list
+            for gt_line_instance, gt_label_3d in zip(gt_lines_instance, gt_labels_3d):
+                pts = np.array(list(gt_line_instance.coords))
+                x = np.array([int((pt[0] - self.pc_range[0]) * scale_x) for pt in pts])
+                y = np.array([int((pt[1] - self.pc_range[1]) * scale_y) for pt in pts])
+                for i in range(len(x) - 1):
+                    rr, cc, val = line_aa(y[i], x[i], y[i+1], x[i+1])
+                    valid_indices = (0 <= rr) & (rr < canvas_height) & (0 <= cc) & (cc < canvas_width)
+                    rr, cc, val = rr[valid_indices], cc[valid_indices], val[valid_indices]
+                    
+                    if out_type == "one-hot-encoded":
+                        output[:, rr, cc] = False
+                        output[gt_label_3d + 1, rr, cc] = True
+                    elif out_type == "integer-encoded":
+                        output[rr, cc] = gt_label_3d + 1
+
+        if vis_car==True and out_type == "one-hot-encoded":
+            seg = self.one_hot_to_rgb(output)
+            car_img = cv2.imread('./figs/lidar_car.png')
+            x_start = int((-1.5 - self.pc_range[0]) * scale_x)
+            x_end = int((1.5 - self.pc_range[0]) * scale_x)
+            y_start = int((-1.2 - self.pc_range[1]) * scale_y)
+            y_end = int((1.2 - self.pc_range[1]) * scale_y)
+            new_height = x_end - x_start
+            new_width = y_end - y_start
+            resized_car = cv2.resize(car_img, (new_height, new_width))
+            seg[:, y_start:y_end, x_start:x_end] = ((torch.tensor(resized_car).permute(2, 0, 1).float())/255.0)
+
+        return self.apply_thicker_stroke(output)
+    
+    def apply_thicker_stroke(self, one_hot_encoded_tensor, stroke_width=5):
+        result_tensor = one_hot_encoded_tensor.clone()
+
+        # Create a binary mask for each label and apply dilation
+        for label in range(1, one_hot_encoded_tensor.shape[0]):  # start from 1 to skip background class
+            mask = one_hot_encoded_tensor[label]
+            dilated_mask = torch.nn.functional.max_pool2d(mask.float().unsqueeze(0).unsqueeze(0), kernel_size=stroke_width, stride=1, padding=stroke_width // 2)
+                    
+            # Resizing the dilated_mask back to the original mask size
+            dilated_mask = torch.nn.functional.interpolate(dilated_mask, size=mask.shape, mode='nearest') > 0
+
+            # Assign the color to the regions in the result tensor where the dilated mask is True
+            result_tensor[label, dilated_mask[0, 0]] = 1
+
+        result_tensor[:-1, result_tensor[3]==1] = 0
+        result_tensor[:-2, result_tensor[2]==1] = 0
+        result_tensor[:-3, result_tensor[1]==1] = 0
+
+        return result_tensor
+
+
+    def get_seg_label_hdmapnet(self, input_dict):
+        colors_plt = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # RGB colors
+        rec = self.nusc.get('sample', input_dict['sample_idx'])
+        vectors = self.get_vectors_hdmapnet(rec)
+
+        # Define the size of the image and the visible area
+        img_width, img_height = self.bev_size[0], self.bev_size[1]  # Change the size as needed
+        x_min, x_max = -30, 30
+        y_min, y_max = -15, 15
+
+        # Create a new image with RGBA format
+        img = Image.new('RGBA', (img_width, img_height))
+        draw = ImageDraw.Draw(img)
+
+        for vector in vectors:
+            pts, pts_num, line_type = vector['pts'], vector['pts_num'], vector['type']
+            pts = pts[:pts_num]
+            
+            # Transform the coordinates to match the image size
+            pts_transformed = [(int((pt[0] - x_min) / (x_max - x_min) * img_width),
+                                int((pt[1] - y_min) / (y_max - y_min) * img_height)) for pt in pts]
+            
+            draw.line(pts_transformed, fill=colors_plt[line_type], width=2)  # Change width as needed
+
+        # Convert the PIL Image to a numpy array
+        X = np.array(img)
+
+        # Create a one-hot encoded tensor
+        one_hot = torch.zeros((4, *X.shape[:2]))  # Create a new tensor with the correct dimensions
+        for c in range(3):
+            one_hot[c+1, :, :] = torch.tensor(X[:, :, c] == 255)  # Set the channel for this color to 1 where the image is this color
+        one_hot[0, :, :] = torch.tensor(np.all(X[:, :, :3] == 0, axis=2))  # Set the last channel to 1 where the image is black
+
+        # Rotate 90 degrees counterclockwise
+        one_hot = torch.rot90(one_hot, -1, [1, 2])
+        one_hot = torch.flip(one_hot, [2])
+        one_hot = F.rotate(one_hot, 180)
+
+        return one_hot
+        # return self.apply_thicker_stroke(one_hot)
+
+    def get_vectors_hdmapnet(self, rec):
+        location = self.nusc.get('log', self.nusc.get('scene', rec['scene_token'])['log_token'])['location']
+        ego_pose = self.nusc.get('ego_pose', self.nusc.get('sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
+        vectors = self.hdmapnet_vector_map.gen_vectorized_samples(location, ego_pose['translation'], ego_pose['rotation'])
+        return vectors
+    
     def prepare_train_data(self, index):
         """
         Training data preparation.
@@ -1042,6 +1222,10 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
         if self.filter_empty_gt and \
                 (example is None or ~(example['gt_labels_3d']._data != -1).any()):
             return None
+        # example = CustomDict(example)
+        # example.add_extra_key('seg_label', self.get_seg_label(example))
+        # example['maptr_seg_label'] = self.get_seg_label(example)
+        example['seg_label'] = self.get_seg_label_hdmapnet(input_dict)
         data_queue.insert(0, example)
         for i in prev_indexs_list:
             i = max(0, i)
@@ -1056,6 +1240,10 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
                         (example is None or ~(example['gt_labels_3d']._data != -1).any()):
                     return None
                 frame_idx = input_dict['frame_idx']
+            # example = CustomDict(example)
+            # example.add_extra_key('seg_label', self.get_seg_label(example))
+            # example['maptr_seg_label'] = self.get_seg_label(example)
+            example['seg_label'] = self.get_seg_label_hdmapnet(input_dict)
             data_queue.insert(0, copy.deepcopy(example))
         return self.union2one(data_queue)
 
@@ -1064,6 +1252,8 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
         convert sample queue into one single sample.
         """
         imgs_list = [each['img'].data for each in queue]
+        if 'seg_label' in queue[0].keys():
+            seg_list = [each['seg_label'] for each in queue]
         metas_map = {}
         prev_pos = None
         prev_angle = None
@@ -1086,6 +1276,9 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
 
         queue[-1]['img'] = DC(torch.stack(imgs_list),
                               cpu_only=False, stack=True)
+        if 'seg_label' in queue[0].keys():
+            queue[-1]['seg_label'] = DC(torch.stack(seg_list),
+                                cpu_only=False, stack=True)
         queue[-1]['img_metas'] = DC(metas_map, cpu_only=True)
         queue = queue[-1]
         return queue
@@ -1110,10 +1303,12 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
                 - ann_info (dict): Annotation info.
         """
         info = self.data_infos[index]
+        # print(f'{"INFO":#^100}\n{self.data_infos}')
+        # from pudb.remote import set_trace; set_trace(term_size=(143, 43))
         # standard protocal modified from SECOND.Pytorch
         input_dict = dict(
             sample_idx=info['token'],
-            # pts_filename=info['lidar_path'],
+            pts_filename=info['lidar_path'],
             lidar_path=info["lidar_path"],
             sweeps=info['sweeps'],
             ego2global_translation=info['ego2global_translation'],
@@ -1225,8 +1420,10 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
         input_dict = self.get_data_info(index)
         self.pre_pipeline(input_dict)
         example = self.pipeline(input_dict)
-        if self.is_vis_on_test:
-            example = self.vectormap_pipeline(example, input_dict)
+        # if self.is_vis_on_test:
+        example = self.vectormap_pipeline(example, input_dict)
+        # example['maptr_seg_label'] = self.get_seg_label(example)
+        example['seg_label'] = self.get_seg_label_hdmapnet(input_dict)
         return example
 
     def __getitem__(self, idx):
@@ -1550,3 +1747,279 @@ def sample_pts_from_line(line,
             num_valid = len(sampled_points)
 
     return sampled_points, num_valid
+
+class CustomDict(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.extra_dict = {}
+
+    def __setitem__(self, key, value):
+        if key not in self:
+            self.extra_dict[key] = value
+        else:
+            super().__setitem__(key, value)
+
+    def __getitem__(self, key):
+        if key in self.extra_dict:
+            return self.extra_dict[key]
+        else:
+            return super().__getitem__(key)
+
+    def __delitem__(self, key):
+        if key in self.extra_dict:
+            del self.extra_dict[key]
+        else:
+            super().__delitem__(key)
+
+    def add_extra_key(self, key, value):
+        self.extra_dict[key] = value
+
+    def remove_extra_key(self, key):
+        if key in self.extra_dict:
+            del self.extra_dict[key]
+        else:
+            raise KeyError(f"Key '{key}' not found in the extra keys")
+
+    def __getstate__(self):
+        return self.copy(), self.extra_dict
+
+    def __setstate__(self, state):
+        self.clear()
+        self.update(state[0])
+        self.extra_dict = state[1]
+
+    def __reduce__(self):
+        return (CustomDict, (), self.__getstate__())
+
+class HDMapNetVectorizedLocalMap(object):
+    def __init__(self,
+                 dataroot,
+                 patch_size,
+                 canvas_size,
+                 line_classes=['road_divider', 'lane_divider'],
+                 ped_crossing_classes=['ped_crossing'],
+                 contour_classes=['road_segment', 'lane'],
+                 sample_dist=1,
+                 num_samples=250,
+                 padding=False,
+                 normalize=False,
+                 fixed_num=-1):
+        '''
+        Args:
+            fixed_num = -1 : no fixed num
+        '''
+        super().__init__()
+        self.data_root = dataroot
+        self.MAPS = ['boston-seaport', 'singapore-hollandvillage',
+                     'singapore-onenorth', 'singapore-queenstown']
+        self.line_classes = line_classes
+        self.ped_crossing_classes = ped_crossing_classes
+        self.polygon_classes = contour_classes
+        self.nusc_maps = {}
+        self.map_explorer = {}
+        for loc in self.MAPS:
+            self.nusc_maps[loc] = NuScenesMap(dataroot=self.data_root, map_name=loc)
+            self.map_explorer[loc] = NuScenesMapExplorer(self.nusc_maps[loc])
+
+        self.patch_size = patch_size
+        self.canvas_size = canvas_size
+        self.sample_dist = sample_dist
+        self.num_samples = num_samples
+        self.padding = padding
+        self.normalize = normalize
+        self.fixed_num = fixed_num
+
+    def gen_vectorized_samples(self, location, ego2global_translation, ego2global_rotation):
+        map_pose = ego2global_translation[:2]
+        rotation = Quaternion(ego2global_rotation)
+
+        patch_box = (map_pose[0], map_pose[1], self.patch_size[0], self.patch_size[1])
+        patch_angle = quaternion_yaw(rotation) / np.pi * 180
+
+        line_geom = self.get_map_geom(patch_box, patch_angle, self.line_classes, location)
+        line_vector_dict = self.line_geoms_to_vectors(line_geom)
+
+        ped_geom = self.get_map_geom(patch_box, patch_angle, self.ped_crossing_classes, location)
+        # ped_vector_list = self.ped_geoms_to_vectors(ped_geom)
+        ped_vector_list = self.line_geoms_to_vectors(ped_geom)['ped_crossing']
+
+        polygon_geom = self.get_map_geom(patch_box, patch_angle, self.polygon_classes, location)
+        poly_bound_list = self.poly_geoms_to_vectors(polygon_geom)
+
+        vectors = []
+        for line_type, vects in line_vector_dict.items():
+            for line, length in vects:
+                vectors.append((line.astype(float), length, CLASS2LABEL.get(line_type, -1)))
+
+        for ped_line, length in ped_vector_list:
+            vectors.append((ped_line.astype(float), length, CLASS2LABEL.get('ped_crossing', -1)))
+
+        for contour, length in poly_bound_list:
+            vectors.append((contour.astype(float), length, CLASS2LABEL.get('contours', -1)))
+
+        # filter out -1
+        filtered_vectors = []
+        for pts, pts_num, type in vectors:
+            if type != -1:
+                filtered_vectors.append({
+                    'pts': pts,
+                    'pts_num': pts_num,
+                    'type': type
+                })
+
+        return filtered_vectors
+
+    def get_map_geom(self, patch_box, patch_angle, layer_names, location):
+        map_geom = []
+        for layer_name in layer_names:
+            if layer_name in self.line_classes:
+                geoms = self.map_explorer[location]._get_layer_line(patch_box, patch_angle, layer_name)
+                map_geom.append((layer_name, geoms))
+            elif layer_name in self.polygon_classes:
+                geoms = self.map_explorer[location]._get_layer_polygon(patch_box, patch_angle, layer_name)
+                map_geom.append((layer_name, geoms))
+            elif layer_name in self.ped_crossing_classes:
+                geoms = self.get_ped_crossing_line(patch_box, patch_angle, location)
+                # geoms = self.map_explorer[location]._get_layer_polygon(patch_box, patch_angle, layer_name)
+                map_geom.append((layer_name, geoms))
+        return map_geom
+
+    def _one_type_line_geom_to_vectors(self, line_geom):
+        line_vectors = []
+        for line in line_geom:
+            if not line.is_empty:
+                if line.geom_type == 'MultiLineString':
+                    for single_line in line.geoms:
+                        line_vectors.append(self.sample_pts_from_line(single_line))
+                elif line.geom_type == 'LineString':
+                    line_vectors.append(self.sample_pts_from_line(line))
+                else:
+                    raise NotImplementedError
+        return line_vectors
+
+    def poly_geoms_to_vectors(self, polygon_geom):
+        roads = polygon_geom[0][1]
+        lanes = polygon_geom[1][1]
+        union_roads = ops.unary_union(roads)
+        union_lanes = ops.unary_union(lanes)
+        union_segments = ops.unary_union([union_roads, union_lanes])
+        max_x = self.patch_size[1] / 2
+        max_y = self.patch_size[0] / 2
+        local_patch = box(-max_x + 0.2, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
+        exteriors = []
+        interiors = []
+        if union_segments.geom_type != 'MultiPolygon':
+            union_segments = MultiPolygon([union_segments])
+        for poly in union_segments.geoms:
+            exteriors.append(poly.exterior)
+            for inter in poly.interiors:
+                interiors.append(inter)
+
+        results = []
+        for ext in exteriors:
+            if ext.is_ccw:
+                ext.coords = list(ext.coords)[::-1]
+            lines = ext.intersection(local_patch)
+            if isinstance(lines, MultiLineString):
+                lines = ops.linemerge(lines)
+            results.append(lines)
+
+        for inter in interiors:
+            if not inter.is_ccw:
+                inter.coords = list(inter.coords)[::-1]
+            lines = inter.intersection(local_patch)
+            if isinstance(lines, MultiLineString):
+                lines = ops.linemerge(lines)
+            results.append(lines)
+
+        return self._one_type_line_geom_to_vectors(results)
+
+    def line_geoms_to_vectors(self, line_geom):
+        line_vectors_dict = dict()
+        for line_type, a_type_of_lines in line_geom:
+            one_type_vectors = self._one_type_line_geom_to_vectors(a_type_of_lines)
+            line_vectors_dict[line_type] = one_type_vectors
+
+        return line_vectors_dict
+
+    def ped_geoms_to_vectors(self, ped_geom):
+        ped_geom = ped_geom[0][1]
+        union_ped = ops.unary_union(ped_geom)
+        if union_ped.geom_type != 'MultiPolygon':
+            union_ped = MultiPolygon([union_ped])
+
+        max_x = self.patch_size[1] / 2
+        max_y = self.patch_size[0] / 2
+        local_patch = box(-max_x + 0.2, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
+        results = []
+        for ped_poly in union_ped:
+            # rect = ped_poly.minimum_rotated_rectangle
+            ext = ped_poly.exterior
+            if not ext.is_ccw:
+                ext.coords = list(ext.coords)[::-1]
+            lines = ext.intersection(local_patch)
+            results.append(lines)
+
+        return self._one_type_line_geom_to_vectors(results)
+
+    def get_ped_crossing_line(self, patch_box, patch_angle, location):
+        def add_line(poly_xy, idx, patch, patch_angle, patch_x, patch_y, line_list):
+            points = [(p0, p1) for p0, p1 in zip(poly_xy[0, idx:idx + 2], poly_xy[1, idx:idx + 2])]
+            line = LineString(points)
+            line = line.intersection(patch)
+            if not line.is_empty:
+                line = affinity.rotate(line, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
+                line = affinity.affine_transform(line, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+                line_list.append(line)
+
+        patch_x = patch_box[0]
+        patch_y = patch_box[1]
+
+        patch = NuScenesMapExplorer.get_patch_coord(patch_box, patch_angle)
+        line_list = []
+        records = getattr(self.nusc_maps[location], 'ped_crossing')
+        for record in records:
+            polygon = self.map_explorer[location].extract_polygon(record['polygon_token'])
+            poly_xy = np.array(polygon.exterior.xy)
+            dist = np.square(poly_xy[:, 1:] - poly_xy[:, :-1]).sum(0)
+            x1, x2 = np.argsort(dist)[-2:]
+
+            add_line(poly_xy, x1, patch, patch_angle, patch_x, patch_y, line_list)
+            add_line(poly_xy, x2, patch, patch_angle, patch_x, patch_y, line_list)
+
+        return line_list
+
+    def sample_pts_from_line(self, line):
+        if self.fixed_num < 0:
+            distances = np.arange(0, line.length, self.sample_dist)
+            sampled_points = np.array([list(line.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+        else:
+            # fixed number of points, so distance is line.length / self.fixed_num
+            distances = np.linspace(0, line.length, self.fixed_num)
+            sampled_points = np.array([list(line.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+
+        if self.normalize:
+            sampled_points = sampled_points / np.array([self.patch_size[1], self.patch_size[0]])
+
+        num_valid = len(sampled_points)
+
+        if not self.padding or self.fixed_num > 0:
+            # fixed num sample can return now!
+            return sampled_points, num_valid
+
+        # fixed distance sampling need padding!
+        num_valid = len(sampled_points)
+
+        if self.fixed_num < 0:
+            if num_valid < self.num_samples:
+                padding = np.zeros((self.num_samples - len(sampled_points), 2))
+                sampled_points = np.concatenate([sampled_points, padding], axis=0)
+            else:
+                sampled_points = sampled_points[:self.num_samples, :]
+                num_valid = self.num_samples
+
+            if self.normalize:
+                sampled_points = sampled_points / np.array([self.patch_size[1], self.patch_size[0]])
+                num_valid = len(sampled_points)
+
+        return sampled_points, num_valid

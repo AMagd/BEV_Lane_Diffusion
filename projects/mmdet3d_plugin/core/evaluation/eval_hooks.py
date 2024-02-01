@@ -75,7 +75,7 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
         from projects.mmdet3d_plugin.bevformer.apis.test import custom_multi_gpu_test # to solve circlur  import
 
-        results = custom_multi_gpu_test(
+        result = custom_multi_gpu_test(
             runner.model,
             self.dataloader,
             tmpdir=tmpdir,
@@ -84,8 +84,8 @@ class CustomDistEvalHook(BaseDistEvalHook):
             print('\n')
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
-            key_score = self.evaluate(runner, results)
+            # key_score = self.evaluate(runner, results)
 
-            if self.save_best:
-                self._save_ckpt(runner, key_score)
+            # if self.save_best:
+            #     self._save_ckpt(runner, key_score)
   

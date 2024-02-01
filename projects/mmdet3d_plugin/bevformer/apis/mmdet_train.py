@@ -89,7 +89,7 @@ def custom_train_detector(model,
         if eval_model is not None:
             eval_model = MMDataParallel(
                 eval_model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
-
+    # from pudb.remote import set_trace; set_trace(term_size=(143, 43))
 
     # build runner
     optimizer = build_optimizer(model, cfg.optimizer)
@@ -161,7 +161,8 @@ def custom_train_detector(model,
             # Replace 'ImageToTensor' to 'DefaultFormatBundle'
             cfg.data.val.pipeline = replace_ImageToTensor(
                 cfg.data.val.pipeline)
-        val_dataset = custom_build_dataset(cfg.data.val, dict(test_mode=True))
+        val_dataset = CustomSubset(custom_build_dataset(cfg.data.val, dict(test_mode=True)), range(16))
+        # val_dataset = custom_build_dataset(cfg.data.val, dict(test_mode=True))
 
         val_dataloader = build_dataloader(
             val_dataset,
@@ -198,3 +199,13 @@ def custom_train_detector(model,
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
 
+from torch.utils.data import Subset
+class CustomSubset(Subset):
+    def __init__(self, dataset, indices):
+        super().__init__(dataset, indices)
+        self.copy_attributes(dataset)
+
+    def copy_attributes(self, dataset):
+        for attr in dir(dataset):
+            if not callable(getattr(dataset, attr)) and not attr.startswith("__"):
+                setattr(self, attr, getattr(dataset, attr))

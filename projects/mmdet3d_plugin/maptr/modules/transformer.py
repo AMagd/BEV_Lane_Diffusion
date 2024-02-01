@@ -63,7 +63,7 @@ class MapTRPerceptionTransformer(BaseModule):
         if modality == 'fusion':
             self.fuser = build_fuser(fuser) #TODO
         self.encoder = build_transformer_layer_sequence(encoder)
-        self.decoder = build_transformer_layer_sequence(decoder)
+        # self.decoder = build_transformer_layer_sequence(decoder)
         self.embed_dims = embed_dims
         self.num_feature_levels = num_feature_levels
         self.num_cams = num_cams
@@ -85,7 +85,7 @@ class MapTRPerceptionTransformer(BaseModule):
             self.num_feature_levels, self.embed_dims))
         self.cams_embeds = nn.Parameter(
             torch.Tensor(self.num_cams, self.embed_dims))
-        self.reference_points = nn.Linear(self.embed_dims, 2) # TODO, this is a hack
+        # self.reference_points = nn.Linear(self.embed_dims, 2) # TODO, this is a hack
         self.can_bus_mlp = nn.Sequential(
             nn.Linear(18, self.embed_dims // 2),
             nn.ReLU(inplace=True),
@@ -109,7 +109,7 @@ class MapTRPerceptionTransformer(BaseModule):
                     m.init_weights()
         normal_(self.level_embeds)
         normal_(self.cams_embeds)
-        xavier_init(self.reference_points, distribution='uniform', bias=0.)
+        # xavier_init(self.reference_points, distribution='uniform', bias=0.)
         xavier_init(self.can_bus_mlp, distribution='uniform', bias=0.)
     # TODO apply fp16 to this module cause grad_norm NAN
     # @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'prev_bev', 'bev_pos'), out_fp32=True)

@@ -6,6 +6,8 @@ _base_ = [
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
+find_unused_parameters = True
+
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
 # point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
@@ -48,6 +50,8 @@ _num_levels_ = 1
 bev_h_ = 200
 bev_w_ = 100
 queue_length = 1 # each sequence contains `queue_length` frames.
+
+# resume_from = "work_dirs/maptr_tiny_r50_24e/epoch_2.pth"
 
 model = dict(
     type='MapTR',
@@ -254,7 +258,7 @@ data = dict(
              data_root=data_root,
              ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
              map_ann_file=data_root + 'nuscenes_map_anns_val.json',
-             pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
+             pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
              pc_range=point_cloud_range,
              fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
              eval_use_same_gt_sample_num_flag=eval_use_same_gt_sample_num_flag,
@@ -278,10 +282,12 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=6e-4,
+    lr=1e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
+            'img_neck': dict(lr_mult=0.1),
+            'pts_bbox_head': dict(lr_mult=0.1),
         }),
     weight_decay=0.01)
 
@@ -293,7 +299,7 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
-total_epochs = 24
+total_epochs = 30
 # total_epochs = 50
 # evaluation = dict(interval=1, pipeline=test_pipeline)
 evaluation = dict(interval=2, pipeline=test_pipeline, metric='chamfer')

@@ -160,17 +160,16 @@ class MapTRHead(DETRHead):
 
         # last reg_branch is used to generate proposal from
         # encode feature map when as_two_stage is True.
-        num_pred = (self.transformer.decoder.num_layers + 1) if \
-            self.as_two_stage else self.transformer.decoder.num_layers
+        num_pred = 6
 
-        if self.with_box_refine:
-            self.cls_branches = _get_clones(fc_cls, num_pred)
-            self.reg_branches = _get_clones(reg_branch, num_pred)
-        else:
-            self.cls_branches = nn.ModuleList(
-                [fc_cls for _ in range(num_pred)])
-            self.reg_branches = nn.ModuleList(
-                [reg_branch for _ in range(num_pred)])
+        # if self.with_box_refine:
+        #     self.cls_branches = _get_clones(fc_cls, num_pred)
+        #     self.reg_branches = _get_clones(reg_branch, num_pred)
+        # else:
+        #     self.cls_branches = nn.ModuleList(
+        #         [fc_cls for _ in range(num_pred)])
+        #     self.reg_branches = nn.ModuleList(
+        #         [reg_branch for _ in range(num_pred)])
 
         if not self.as_two_stage:
             self.bev_embedding = nn.Embedding(
@@ -180,23 +179,23 @@ class MapTRHead(DETRHead):
                                                     self.embed_dims * 2)
             elif self.query_embed_type == 'instance_pts':
                 self.query_embedding = None
-                self.instance_embedding = nn.Embedding(self.num_vec, self.embed_dims * 2)
-                self.pts_embedding = nn.Embedding(self.num_pts_per_vec, self.embed_dims * 2)
+                # self.instance_embedding = nn.Embedding(self.num_vec, self.embed_dims * 2)
+                # self.pts_embedding = nn.Embedding(self.num_pts_per_vec, self.embed_dims * 2)
 
     def init_weights(self):
         """Initialize weights of the DeformDETR head."""
         self.transformer.init_weights()
         if self.loss_cls.use_sigmoid:
             bias_init = bias_init_with_prob(0.01)
-            for m in self.cls_branches:
-                nn.init.constant_(m[-1].bias, bias_init)
+            # for m in self.cls_branches:
+            #     nn.init.constant_(m[-1].bias, bias_init)
         # for m in self.reg_branches:
         #     constant_init(m[-1], 0, bias=0)
         # nn.init.constant_(self.reg_branches[0][-1].bias.data[2:], 0.)
     
     # @auto_fp16(apply_to=('mlvl_feats'))
     @force_fp32(apply_to=('mlvl_feats', 'prev_bev'))
-    def forward(self, mlvl_feats, lidar_feat, img_metas, prev_bev=None,  only_bev=False):
+    def forward(self, mlvl_feats, lidar_feat, img_metas, prev_bev=None,  only_bev=True):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -218,96 +217,100 @@ class MapTRHead(DETRHead):
         # import pdb;pdb.set_trace()
         if self.query_embed_type == 'all_pts':
             object_query_embeds = self.query_embedding.weight.to(dtype)
-        elif self.query_embed_type == 'instance_pts':
-            pts_embeds = self.pts_embedding.weight.unsqueeze(0)
-            instance_embeds = self.instance_embedding.weight.unsqueeze(1)
-            object_query_embeds = (pts_embeds + instance_embeds).flatten(0, 1).to(dtype)
+        # elif self.query_embed_type == 'instance_pts':
+        #     pts_embeds = self.pts_embedding.weight.unsqueeze(0)
+        #     instance_embeds = self.instance_embedding.weight.unsqueeze(1)
+        #     object_query_embeds = (pts_embeds + instance_embeds).flatten(0, 1).to(dtype)
         bev_queries = self.bev_embedding.weight.to(dtype)
 
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
                                device=bev_queries.device).to(dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
 
-        if only_bev:  # only use encoder to obtain BEV features, TODO: refine the workaround
-            return self.transformer.get_bev_features(
-                mlvl_feats,
-                lidar_feat,
-                bev_queries,
-                self.bev_h,
-                self.bev_w,
-                grid_length=(self.real_h / self.bev_h,
-                             self.real_w / self.bev_w),
-                bev_pos=bev_pos,
-                img_metas=img_metas,
-                prev_bev=prev_bev,
-            )
-        else:
-            outputs = self.transformer(
-                mlvl_feats,
-                lidar_feat,
-                bev_queries,
-                object_query_embeds,
-                self.bev_h,
-                self.bev_w,
-                grid_length=(self.real_h / self.bev_h,
-                             self.real_w / self.bev_w),
-                bev_pos=bev_pos,
-                reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
-                cls_branches=self.cls_branches if self.as_two_stage else None,
-                img_metas=img_metas,
-                prev_bev=prev_bev
+        # if only_bev:  # only use encoder to obtain BEV features, TODO: refine the workaround
+        return self.transformer.get_bev_features(
+            mlvl_feats,
+            lidar_feat,
+            bev_queries,
+            self.bev_h,
+            self.bev_w,
+            grid_length=(self.real_h / self.bev_h,
+                            self.real_w / self.bev_w),
+            bev_pos=bev_pos,
+            img_metas=img_metas,
+            prev_bev=prev_bev,
         )
+        # else:
+        #     outputs = self.transformer(
+        #         mlvl_feats,
+        #         lidar_feat,
+        #         bev_queries,
+        #         object_query_embeds,
+        #         self.bev_h,
+        #         self.bev_w,
+        #         grid_length=(self.real_h / self.bev_h,
+        #                      self.real_w / self.bev_w),
+        #         bev_pos=bev_pos,
+        #         reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
+        #         cls_branches=self.cls_branches if self.as_two_stage else None,
+        #         img_metas=img_metas,
+        #         prev_bev=prev_bev
+        # )
 
-        bev_embed, hs, init_reference, inter_references = outputs
-        hs = hs.permute(0, 2, 1, 3)
-        outputs_classes = []
-        outputs_coords = []
-        outputs_pts_coords = []
-        for lvl in range(hs.shape[0]):
-            if lvl == 0:
-                # import pdb;pdb.set_trace()
-                reference = init_reference
-            else:
-                reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
-            # import pdb;pdb.set_trace()
-            # vec_embedding = hs[lvl].reshape(bs, self.num_vec, -1)
-            outputs_class = self.cls_branches[lvl](hs[lvl]
-                                            .view(bs,self.num_vec, self.num_pts_per_vec,-1)
-                                            .mean(2))
-            tmp = self.reg_branches[lvl](hs[lvl])
+        # bev_embed, *_ = outputs
 
-            # TODO: check the shape of reference
-            assert reference.shape[-1] == 2
-            tmp[..., 0:2] += reference[..., 0:2]
-            # tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
-            tmp = tmp.sigmoid() # cx,cy,w,h
-            # import pdb;pdb.set_trace()
-            # tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
-            #                  self.pc_range[0]) + self.pc_range[0])
-            # tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
-            #                  self.pc_range[1]) + self.pc_range[1])
-            # tmp = tmp.reshape(bs, self.num_vec,-1)
-            # TODO: check if using sigmoid
-            outputs_coord, outputs_pts_coord = self.transform_box(tmp)
-            outputs_classes.append(outputs_class)
-            outputs_coords.append(outputs_coord)
-            outputs_pts_coords.append(outputs_pts_coord)
+        # return bev_embed
+    
+        # bev_embed, hs, init_reference, inter_references = outputs
+        # hs = hs.permute(0, 2, 1, 3)
+        # outputs_classes = []
+        # outputs_coords = []
+        # outputs_pts_coords = []
+        # for lvl in range(hs.shape[0]):
+        #     if lvl == 0:
+        #         # import pdb;pdb.set_trace()
+        #         reference = init_reference
+        #     else:
+        #         reference = inter_references[lvl - 1]
+        #     reference = inverse_sigmoid(reference)
+        #     # import pdb;pdb.set_trace()
+        #     # vec_embedding = hs[lvl].reshape(bs, self.num_vec, -1)
+        #     outputs_class = self.cls_branches[lvl](hs[lvl]
+        #                                     .view(bs,self.num_vec, self.num_pts_per_vec,-1)
+        #                                     .mean(2))
+        #     tmp = self.reg_branches[lvl](hs[lvl])
 
-        outputs_classes = torch.stack(outputs_classes)
-        outputs_coords = torch.stack(outputs_coords)
-        outputs_pts_coords = torch.stack(outputs_pts_coords)
-        outs = {
-            'bev_embed': bev_embed,
-            'all_cls_scores': outputs_classes,
-            'all_bbox_preds': outputs_coords,
-            'all_pts_preds': outputs_pts_coords,
-            'enc_cls_scores': None,
-            'enc_bbox_preds': None,
-            'enc_pts_preds': None
-        }
+        #     # TODO: check the shape of reference
+        #     assert reference.shape[-1] == 2
+        #     tmp[..., 0:2] += reference[..., 0:2]
+        #     # tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
+        #     tmp = tmp.sigmoid() # cx,cy,w,h
+        #     # import pdb;pdb.set_trace()
+        #     # tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
+        #     #                  self.pc_range[0]) + self.pc_range[0])
+        #     # tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
+        #     #                  self.pc_range[1]) + self.pc_range[1])
+        #     # tmp = tmp.reshape(bs, self.num_vec,-1)
+        #     # TODO: check if using sigmoid
+        #     outputs_coord, outputs_pts_coord = self.transform_box(tmp)
+        #     outputs_classes.append(outputs_class)
+        #     outputs_coords.append(outputs_coord)
+        #     outputs_pts_coords.append(outputs_pts_coord)
 
-        return outs
+        # outputs_classes = torch.stack(outputs_classes)
+        # outputs_coords = torch.stack(outputs_coords)
+        # outputs_pts_coords = torch.stack(outputs_pts_coords)
+        # outs = {
+        #     'bev_embed': bev_embed,
+        #     'all_cls_scores': outputs_classes,
+        #     'all_bbox_preds': outputs_coords,
+        #     'all_pts_preds': outputs_pts_coords,
+        #     'enc_cls_scores': None,
+        #     'enc_bbox_preds': None,
+        #     'enc_pts_preds': None
+        # }
+
+        # return outs
     def transform_box(self, pts, y_first=False):
         """
         Converting the points set into bounding box.
